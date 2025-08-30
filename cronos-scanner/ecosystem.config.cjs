@@ -15,6 +15,19 @@ module.exports = {
     time: true,
     max_restarts: 10,
     min_uptime: '10s',
-    kill_timeout: 5000
+    kill_timeout: 5000,
+    // Enhanced restart policy
+    restart_delay: 4000,
+    exp_backoff_restart_delay: 100,
+    // Better monitoring
+    pmx: true,
+    // Auto-restart on file changes (optional)
+    watch: ['index.mjs', 'provider.js'],
+    ignore_watch: ['node_modules', 'logs', '*.db'],
+    // Environment-specific configs
+    env_production: {
+      NODE_ENV: 'production',
+      PM2_HOME: './logs'
+    }
   }]
 };

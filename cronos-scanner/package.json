@@ -13,6 +13,12 @@
         "test-ws": "node test-ws.mjs",
         "setup": "node setup-env.mjs",
         "health": "node health-server.mjs",
-        "dev": "node --watch index.mjs"
+        "dev": "node --watch index.mjs",
+        "persistent": "node setup-persistent.mjs",
+        "pm2:start": "pm2 start ecosystem.config.cjs",
+        "pm2:stop": "pm2 stop all",
+        "pm2:restart": "pm2 restart all",
+        "pm2:status": "pm2 status",
+        "pm2:logs": "pm2 logs"
     }
 }

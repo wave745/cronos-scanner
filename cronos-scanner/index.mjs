@@ -138,8 +138,124 @@ const erc20Abi = [
   { "constant": true, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function" }
 ];
 
+// Transfer event topic for minting detection
+const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const zeroAddress = '0x0000000000000000000000000000000000000000';
+
 // Pair detection
 const pairCreatedTopic = '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9';
+
+// LP Token detection
+async function detectLPTokens(provider, blockNumber) {
+  try {
+    // Look for PairCreated events from known factories
+    const logs = await provider.getLogs({
+      fromBlock: blockNumber,
+      toBlock: blockNumber,
+      topics: [pairCreatedTopic]
+    });
+
+    const lpEvents = [];
+    
+    for (const log of logs) {
+      try {
+        // Parse the PairCreated event
+        const token0 = '0x' + log.topics[1].slice(26).toLowerCase();
+        const token1 = '0x' + log.topics[2].slice(26).toLowerCase();
+        const pairAddress = '0x' + log.topics[3].slice(26).toLowerCase();
+        
+        // Skip if we've already seen this LP pair
+        if (await seen(pairAddress)) continue;
+        
+        // Get token symbols for better identification
+        let token0Symbol = 'Unknown';
+        let token1Symbol = 'Unknown';
+        
+        try {
+          const token0Contract = new Contract(token0, erc20Abi, provider);
+          const token1Contract = new Contract(token1, erc20Abi, provider);
+          
+          const [symbol0, symbol1] = await Promise.allSettled([
+            token0Contract.symbol().catch(() => null),
+            token1Contract.symbol().catch(() => null)
+          ]);
+          
+          token0Symbol = symbol0.status === 'fulfilled' ? symbol0.value : 'Unknown';
+          token1Symbol = symbol1.status === 'fulfilled' ? symbol1.value : 'Unknown';
+        } catch (error) {
+          console.log(`Error getting token symbols:`, error.message);
+        }
+        
+        lpEvents.push({
+          pairAddress,
+          token0,
+          token1,
+          token0Symbol,
+          token1Symbol,
+          txHash: log.transactionHash,
+          blockNumber
+        });
+        
+        console.log(`🎯 Found LP pair creation: ${token0Symbol} / ${token1Symbol} at ${pairAddress}`);
+      } catch (error) {
+        console.log(`Error processing LP log:`, error.message);
+      }
+    }
+    
+    return lpEvents;
+  } catch (error) {
+    console.log(`Error detecting LP tokens:`, error.message);
+    return [];
+  }
+}
+
+// Minting detection
+async function detectMinting(provider, blockNumber) {
+  try {
+    // Look for Transfer events from zero address (minting)
+    const logs = await provider.getLogs({
+      fromBlock: blockNumber,
+      toBlock: blockNumber,
+      topics: [transferTopic, '0x0000000000000000000000000000000000000000000000000000000000000000'] // from zero address
+    });
+
+    const mintingEvents = [];
+    
+    for (const log of logs) {
+      try {
+        // Extract token address and recipient
+        const tokenAddress = log.address.toLowerCase();
+        const recipient = '0x' + log.topics[2].slice(26).toLowerCase();
+        const amount = BigInt(log.data);
+        
+        // Skip if we've already seen this token
+        if (await seen(tokenAddress)) continue;
+        
+        // Probe the token to get metadata
+        const meta = await probe(provider, tokenAddress);
+        if (!meta) continue;
+        
+        mintingEvents.push({
+          tokenAddress,
+          recipient,
+          amount,
+          metadata: meta,
+          txHash: log.transactionHash,
+          logIndex: log.logIndex
+        });
+        
+        console.log(`🎯 Found minting event for token ${meta.symbol}: ${amount} tokens to ${recipient}`);
+      } catch (error) {
+        console.log(`Error processing minting log:`, error.message);
+      }
+    }
+    
+    return mintingEvents;
+  } catch (error) {
+    console.log(`Error detecting minting:`, error.message);
+    return [];
+  }
+}
 
 async function findPair(provider, token, fromBlock, toBlock) {
   if (!FACTORIES.length) return null;
@@ -296,7 +412,58 @@ async function handleBlock(provider, bn) {
 
   const txs = block.transactions || [];
   let deployments = 0;
+  let mintings = 0;
+  let lpTokens = 0;
 
+  // First, check for LP token events
+  const lpEvents = await detectLPTokens(provider, bn);
+  for (const event of lpEvents) {
+    console.log(`🎯 Processing LP event for ${event.token0Symbol} / ${event.token1Symbol}`);
+    
+    const text =
+`🆕 New LP Token Added!
+
+Name: ${event.token0Symbol} / ${event.token1Symbol}
+Address: ${event.pairAddress}
+Block: ${bn}
+Transaction: ${event.txHash}
+
+Created: ${ago(Number(block.timestamp) * 1000)}`;
+
+    await tg(text, event.pairAddress, event.txHash);
+    await mark(event.pairAddress, bn);
+    lpTokens++;
+  }
+
+  // Second, check for minting events
+  const mintingEvents = await detectMinting(provider, bn);
+  for (const event of mintingEvents) {
+    console.log(`🎯 Processing minting event for ${event.metadata.symbol}`);
+    
+    // Format amount with decimals using BigInt arithmetic
+    const decimals = event.metadata.decimals || 18;
+    const divisor = BigInt(10 ** decimals);
+    const wholePart = event.amount / divisor;
+    const fractionalPart = event.amount % divisor;
+    const formattedAmount = wholePart.toString() + (fractionalPart > 0n ? '.' + fractionalPart.toString().padStart(Number(decimals), '0').replace(/0+$/, '') : '');
+    
+    const text =
+`🆕 New Token Minted!
+
+Name: ${event.metadata.name || '-'} (${event.metadata.symbol || '-'})
+Amount: ${formattedAmount} ${event.metadata.symbol}
+CA: ${event.tokenAddress}
+Block: ${bn}
+Recipient: ${event.recipient}
+
+Created: ${ago(Number(block.timestamp) * 1000)}`;
+
+    await tg(text, event.tokenAddress, event.txHash);
+    await mark(event.tokenAddress, bn);
+    mintings++;
+  }
+
+  // Then check for contract deployments
   for (const raw of txs) {
     // Support both "hash string" and "full tx object"
     const isHash = typeof raw === 'string';
@@ -367,9 +534,11 @@ Creator: ${creator}
     deployments++;
   }
 
-  if (deployments === 0) {
+  if (deployments === 0 && mintings === 0 && lpTokens === 0) {
     // Keep logs clean; no more "malformed" spam
-    // console.log(`📊 Block ${bn}: no token deployments`);
+    // console.log(`📊 Block ${bn}: no token deployments, mintings, or LP tokens`);
+  } else {
+    console.log(`📊 Block ${bn}: ${deployments} deployments, ${mintings} mintings, ${lpTokens} LP tokens`);
   }
 }
 
@@ -423,7 +592,7 @@ async function main() {
   let useWebSocket = false;
   
   try {
-    if (process.env.CRONOS_WS) {
+    if (false && process.env.CRONOS_WS) { // Temporarily disable WebSocket
       console.log('🔌 Attempting WebSocket connection...');
       
       // Test WebSocket connection with timeout
@@ -508,9 +677,10 @@ async function main() {
     let running = false;
     let consecutiveErrors = 0;
     const maxConsecutiveErrors = 10;
-    let totalBlocksProcessed = 0;
-    let totalContractDeployments = 0;
-    let totalValidTokens = 0;
+         let totalBlocksProcessed = 0;
+     let totalContractDeployments = 0;
+     let totalValidTokens = 0;
+     let totalLPTokens = 0;
 
     async function pollLoop() {
       if (running) return;
@@ -544,10 +714,10 @@ async function main() {
                 }
               }
               
-              // Print statistics every 100 blocks
-              if (totalBlocksProcessed % 100 === 0) {
-                console.log(`📊 Statistics: ${totalBlocksProcessed} blocks processed, ${totalContractDeployments} deployments, ${totalValidTokens} tokens found`);
-              }
+                             // Print statistics every 100 blocks
+               if (totalBlocksProcessed % 100 === 0) {
+                 console.log(`📊 Statistics: ${totalBlocksProcessed} blocks processed, ${totalContractDeployments} deployments, ${totalValidTokens} tokens found, ${totalLPTokens} LP tokens`);
+               }
             }
 
             // Adaptive delay based on error rate
