@@ -1,0 +1,18 @@
+{
+    "name": "cronos-scanner",
+    "type": "module",
+    "version": "1.0.0",
+    "dependencies": {
+        "dotenv": "^16.4.5",
+        "ethers": "^6.15.0",
+        "node-fetch": "2",
+        "sqlite3": "^5.1.7"
+    },
+    "scripts": {
+        "start": "node index.mjs",
+        "test-ws": "node test-ws.mjs",
+        "setup": "node setup-env.mjs",
+        "health": "node health-server.mjs",
+        "dev": "node --watch index.mjs"
+    }
+}
