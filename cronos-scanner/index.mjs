@@ -717,7 +717,7 @@ async function main() {
   }
 }
 
-// Efficient event listeners for minting and LP detection
+// Efficient event listeners for minting, LP detection, and contract deployments
 async function setupEventListeners(provider) {
   console.log('🔧 Setting up event listeners...');
 
@@ -826,7 +826,77 @@ Created: ${ago(Date.now())}`;
     });
   }
 
-  console.log(`✅ Event listeners set up for ${FACTORIES.length} factories`);
+  // New block listener for contract deployments
+  provider.on('block', async (blockNumber) => {
+    try {
+      console.log(`📦 Processing block ${blockNumber} for contract deployments...`);
+      
+      const block = await provider.getBlock(blockNumber, true);
+      if (!block || !block.transactions) return;
+
+      for (const tx of block.transactions) {
+        try {
+          // Check if this is a contract deployment (to address is null)
+          if (tx.to === null) {
+            console.log(`🏗️  Contract deployment detected in tx: ${tx.hash}`);
+            
+            // Get transaction receipt to find contract address
+            const receipt = await provider.getTransactionReceipt(tx.hash);
+            if (!receipt || !receipt.contractAddress) {
+              console.log(`❌ No contract address found in receipt for ${tx.hash}`);
+              continue;
+            }
+
+            const contractAddress = receipt.contractAddress.toLowerCase();
+            
+            // Skip if we've already seen this contract
+            if (await seen(contractAddress)) {
+              console.log(`⚠️  Contract ${contractAddress} already seen, skipping`);
+              continue;
+            }
+
+            // Try to probe if it's a token
+            const meta = await probe(provider, contractAddress);
+            
+            let text;
+            if (meta) {
+              // It's a token contract
+              text = `🆕 New CRC-20 Token Contract Created!
+
+Name: ${meta.name || '-'} (${meta.symbol || '-'})
+CA: ${contractAddress}
+Block: ${blockNumber}
+Creator: ${tx.from}
+Supply: ${meta.totalSupply.toString()}
+
+Created: ${ago(Date.now())}`;
+            } else {
+              // It's a regular contract
+              text = `🚀 New Contract Created!
+
+CA: ${contractAddress}
+Block: ${blockNumber}
+Creator: ${tx.from}
+Tx: ${tx.hash}
+
+Created: ${ago(Date.now())}`;
+            }
+
+            await tg(text, contractAddress, tx.hash);
+            await mark(contractAddress, blockNumber);
+
+            console.log(`✅ Processed contract deployment: ${contractAddress}`);
+          }
+        } catch (error) {
+          console.error(`❌ Error processing transaction ${tx.hash}:`, error.message);
+        }
+      }
+    } catch (error) {
+      console.error(`❌ Error processing block ${blockNumber}:`, error.message);
+    }
+  });
+
+  console.log(`✅ Event listeners set up for ${FACTORIES.length} factories + contract deployments`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
