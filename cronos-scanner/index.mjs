@@ -567,7 +567,7 @@ async function testAddress(address) {
 
 // Main function
 async function main() {
-  console.log('🚀 Starting enhanced Cronos CRC-20/ERC-20 token scanner with WebSocket...');
+  console.log('🚀 Starting enhanced Cronos CRC-20/ERC-20 & LP token scanner with WebSocket...');
   console.log('='.repeat(60));
   console.log('Environment variables loaded:');
   console.log('  TG_TOKEN:', TG_TOKEN ? '✅ Set' : '❌ Not set');
@@ -578,7 +578,7 @@ async function main() {
   console.log('  RPC Endpoints:', RPC_ENDPOINTS.length);
   console.log('  Factories:', FACTORIES.length);
   console.log('='.repeat(60));
-  
+
   // Check if we're testing a specific address
   const testAddr = process.argv[2];
   if (testAddr) {
@@ -586,16 +586,16 @@ async function main() {
     await testAddress(testAddr);
     process.exit(0);
   }
-  
-  // Try WebSocket first, fallback to HTTP polling
+
+  // Initialize provider manager
+  const providerManager = new ProviderManager();
   let provider;
-  let useWebSocket = false;
-  
+
   try {
-    if (false && process.env.CRONOS_WS) { // Temporarily disable WebSocket
+    // Try WebSocket first
+    if (process.env.CRONOS_WS) {
       console.log('🔌 Attempting WebSocket connection...');
-      
-      // Test WebSocket connection with timeout
+
       try {
         provider = makeProvider();
         const currentBlock = await Promise.race([
@@ -603,137 +603,103 @@ async function main() {
           new Promise((_, reject) => setTimeout(() => reject(new Error('WebSocket timeout')), 10000))
         ]);
         console.log(`✅ WebSocket connected! Current block: ${currentBlock}`);
-        useWebSocket = true;
       } catch (wsTestError) {
         console.log(`❌ WebSocket test failed: ${wsTestError.message}`);
         throw wsTestError;
       }
-      
-      // Backfill to catch missed tokens (including WSW at block 29,561,825)
-      const currentBlock = await provider.getBlockNumber();
-      const backfillStartBlock = 29561800; // Just before the WSW deployment at 29,561,825
-      
-      console.log(`🔄 Backfilling blocks from ${backfillStartBlock} to ${currentBlock} to catch missed tokens...`);
-      
-      for (let blockNum = backfillStartBlock; blockNum <= currentBlock; blockNum++) {
-        try {
-          console.log(`📦 Processing backfill block: ${blockNum}`);
-          await handleBlock(provider, blockNum);
-          
-          // Small delay to avoid overwhelming the provider
-          if (blockNum % 10 === 0) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-          }
-        } catch (error) {
-          console.error(`❌ Error processing backfill block ${blockNum}:`, error.message);
-        }
-      }
-      
-      console.log(`✅ Backfill complete! Now monitoring for new blocks...`);
-      
-      // Set up WebSocket block listener for future blocks
-      provider.on('block', async (blockNumber) => {
-        console.log(`📦 New block via WebSocket: ${blockNumber}`);
-        try {
-          await handleBlock(provider, blockNumber);
-        } catch (error) {
-          console.error(`❌ Error processing WebSocket block ${blockNumber}:`, error.message);
-        }
-      });
-      
+
+      console.log('🎧 Setting up efficient event listeners...');
+
+      // Set up efficient log-based event listeners
+      setupEventListeners(provider);
+
+      console.log('✅ Event listeners active - monitoring for new events...');
+
       // Handle WebSocket errors
       provider._websocket?.on?.('error', (error) => {
         console.error(`❌ WebSocket error: ${error.message}`);
         console.log('🔄 Falling back to HTTP polling...');
-        // Don't exit, let the error bubble up to trigger fallback
         throw error;
       });
-      
+
       // Handle WebSocket close
       provider._websocket?.on?.('close', (code, reason) => {
         console.error(`❌ WebSocket closed: ${code} - ${reason}`);
         console.log('🔄 Falling back to HTTP polling...');
         throw new Error('WebSocket connection closed');
       });
-      
-      console.log('🎧 WebSocket listener active - waiting for new blocks...');
-      
+
       // Keep the process alive
       process.on('SIGINT', () => {
         console.log('\n🛑 Shutting down gracefully...');
         process.exit(0);
       });
-      
+
     } else {
       throw new Error('No WebSocket URL configured');
     }
   } catch (wsError) {
     console.log(`⚠️  WebSocket failed: ${wsError.message}`);
     console.log('🔄 Falling back to HTTP polling...');
-    
-    // Fallback to HTTP polling
-    const providerManager = new ProviderManager();
-    let lastProcessed = 29561800; // Start from just before the WSW deployment at 29,561,825
+
+    // Fallback to HTTP polling with current block start
+    provider = providerManager.currentProvider;
+    let lastProcessed = await providerManager.executeWithFallback(provider => provider.getBlockNumber());
+    console.log(`📍 Starting from current block: ${lastProcessed}`);
+
     let running = false;
     let consecutiveErrors = 0;
     const maxConsecutiveErrors = 10;
-         let totalBlocksProcessed = 0;
-     let totalContractDeployments = 0;
-     let totalValidTokens = 0;
-     let totalLPTokens = 0;
+    let totalBlocksProcessed = 0;
 
     async function pollLoop() {
       if (running) return;
       running = true;
-      
+
       try {
         while (true) {
           try {
             const latest = await providerManager.executeWithFallback(provider => provider.getBlockNumber());
             console.log(`Latest block: ${latest}, processing from ${lastProcessed + 1}`);
-            
-            if (lastProcessed === 29561800) {
-              console.log(`🔄 Backfilling to catch missed tokens (including WSW at block 29,561,825)...`);
-            }
 
             while (lastProcessed < latest) {
               lastProcessed += 1;
               totalBlocksProcessed++;
-              
+
               try {
                 await handleBlock(providerManager.currentProvider, lastProcessed);
                 consecutiveErrors = 0; // Reset error counter on success
               } catch (blockError) {
                 console.error(`❌ Error processing block ${lastProcessed}:`, blockError.message);
                 consecutiveErrors++;
-                
+
                 if (consecutiveErrors >= maxConsecutiveErrors) {
                   console.log(`⚠️  Too many consecutive errors (${consecutiveErrors}), switching provider...`);
                   await providerManager.switchProvider();
                   consecutiveErrors = 0;
                 }
               }
-              
-                             // Print statistics every 100 blocks
-               if (totalBlocksProcessed % 100 === 0) {
-                 console.log(`📊 Statistics: ${totalBlocksProcessed} blocks processed, ${totalContractDeployments} deployments, ${totalValidTokens} tokens found, ${totalLPTokens} LP tokens`);
-               }
+
+              // Print statistics every 100 blocks
+              if (totalBlocksProcessed % 100 === 0) {
+                console.log(`📊 Statistics: ${totalBlocksProcessed} blocks processed`);
+              }
             }
 
             // Adaptive delay based on error rate
             const delay = consecutiveErrors > 0 ? 3000 : 1500;
             await new Promise(resolve => setTimeout(resolve, delay));
-            
+
           } catch (error) {
             console.error('❌ Polling error:', error.message);
             consecutiveErrors++;
-            
+
             if (consecutiveErrors >= maxConsecutiveErrors) {
               console.log(`⚠️  Too many consecutive errors (${consecutiveErrors}), switching provider...`);
               await providerManager.switchProvider();
               consecutiveErrors = 0;
             }
-            
+
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
         }
@@ -744,8 +710,123 @@ async function main() {
       }
     }
 
+    // Set up event listeners even in HTTP fallback mode
+    setupEventListeners(provider);
+
     pollLoop();
   }
+}
+
+// Efficient event listeners for minting and LP detection
+async function setupEventListeners(provider) {
+  console.log('🔧 Setting up event listeners...');
+
+  // CRC-20 minting events: Transfer(from=0x0, *, amount)
+  provider.on({ topics: [transferTopic, zeroAddress] }, async (log) => {
+    try {
+      console.log(`🎯 Minting event detected: ${log.transactionHash}`);
+
+      const tokenAddress = log.address.toLowerCase();
+      const recipient = '0x' + log.topics[2].slice(26).toLowerCase();
+      const amount = BigInt(log.data);
+
+      // Skip if we've already seen this token
+      if (await seen(tokenAddress)) {
+        console.log(`⚠️  Token ${tokenAddress} already seen, skipping`);
+        return;
+      }
+
+      // Probe the token to get metadata
+      const meta = await probe(provider, tokenAddress);
+      if (!meta) {
+        console.log(`❌ Token ${tokenAddress} is not a valid ERC-20 token`);
+        return;
+      }
+
+      // Format amount with decimals
+      const decimals = meta.decimals || 18;
+      const divisor = BigInt(10 ** decimals);
+      const wholePart = amount / divisor;
+      const fractionalPart = amount % divisor;
+      const formattedAmount = wholePart.toString() + (fractionalPart > 0n ? '.' + fractionalPart.toString().padStart(Number(decimals), '0').replace(/0+$/, '') : '');
+
+      const text = `🆕 New Token Minted!
+
+Name: ${meta.name || '-'} (${meta.symbol || '-'})
+Amount: ${formattedAmount} ${meta.symbol}
+CA: ${tokenAddress}
+Block: ${log.blockNumber}
+Recipient: ${recipient}
+
+Created: ${ago(Date.now())}`;
+
+      await tg(text, tokenAddress, log.transactionHash);
+      await mark(tokenAddress, log.blockNumber);
+
+      console.log(`✅ Processed minting event for ${meta.symbol}`);
+    } catch (error) {
+      console.error('❌ Error processing minting event:', error.message);
+    }
+  });
+
+  // LP pair creation events for each factory
+  for (const factory of FACTORIES) {
+    if (!factory) continue;
+
+    provider.on({ address: factory, topics: [pairCreatedTopic] }, async (log) => {
+      try {
+        console.log(`🎯 LP creation event detected at factory ${factory}: ${log.transactionHash}`);
+
+        // Parse the PairCreated event
+        const token0 = '0x' + log.topics[1].slice(26).toLowerCase();
+        const token1 = '0x' + log.topics[2].slice(26).toLowerCase();
+        const pairAddress = '0x' + log.topics[3].slice(26).toLowerCase();
+
+        // Skip if we've already seen this LP pair
+        if (await seen(pairAddress)) {
+          console.log(`⚠️  LP pair ${pairAddress} already seen, skipping`);
+          return;
+        }
+
+        // Get token symbols for better identification
+        let token0Symbol = 'Unknown';
+        let token1Symbol = 'Unknown';
+
+        try {
+          const token0Contract = new Contract(token0, erc20Abi, provider);
+          const token1Contract = new Contract(token1, erc20Abi, provider);
+
+          const [symbol0, symbol1] = await Promise.allSettled([
+            token0Contract.symbol().catch(() => null),
+            token1Contract.symbol().catch(() => null)
+          ]);
+
+          token0Symbol = symbol0.status === 'fulfilled' ? symbol0.value : 'Unknown';
+          token1Symbol = symbol1.status === 'fulfilled' ? symbol1.value : 'Unknown';
+        } catch (error) {
+          console.log(`Error getting token symbols:`, error.message);
+        }
+
+        const text = `🆕 New LP Token Added!
+
+Name: ${token0Symbol} / ${token1Symbol}
+Pair Address: ${pairAddress}
+Block: ${log.blockNumber}
+Transaction: ${log.transactionHash}
+
+Created: ${ago(Date.now())}`;
+
+        await tg(text, pairAddress, log.transactionHash);
+        await mark(pairAddress, log.blockNumber);
+
+        console.log(`✅ Processed LP creation for ${token0Symbol}/${token1Symbol}`);
+      } catch (error) {
+        console.error('❌ Error processing LP event:', error.message);
+      }
+    });
+  }
+
+  console.log(`✅ Event listeners set up for ${FACTORIES.length} factories`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
